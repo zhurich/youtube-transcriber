@@ -1,0 +1,28 @@
+[Unit]
+Description=YouTube transcriber Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=__APP_DIR__
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=__APP_DIR__
+Environment=XDG_CACHE_HOME=__APP_DIR__/data/cache
+Environment=DENO_DIR=__APP_DIR__/data/deno
+ExecStart=__APP_DIR__/.venv/bin/python -m app
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ReadWritePaths=__APP_DIR__/data
+
+[Install]
+WantedBy=multi-user.target
