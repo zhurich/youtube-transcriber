@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import html
 import logging
 import mimetypes
@@ -9,7 +10,7 @@ import re
 import shutil
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -25,6 +26,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    ReactionTypeEmoji,
 )
 
 from app.audio import (
@@ -62,6 +64,8 @@ HELP_TEXT = (
     "или видеосообщение. Я извлеку звук, расшифрую его через OpenAI и верну текст. "
     "Под расшифровкой будет кнопка для краткого конспекта.\n\n"
     "Команды:\n"
+    "/group — режим группы: копится несколько записей, затем одна общая расшифровка\n"
+    "/cancel — выйти из режима группы и забыть собранное\n"
     "/help — эта справка\n"
     "/id — ваш Telegram ID (нужен для списка доступа)"
 )
@@ -86,6 +90,13 @@ class Job:
     status_message_id: int
     url: str | None = None
     media: MediaSource | None = None
+    batch: list[MediaSource] | None = None
+
+    @property
+    def items(self) -> list[MediaSource]:
+        if self.batch:
+            return self.batch
+        return [self.media] if self.media else []
 
 
 @dataclass
@@ -165,6 +176,112 @@ def extract_media(message: Message) -> MediaSource | None:
             )
 
     return None
+
+
+@dataclass
+class GroupSession:
+    """Записи, накопленные в режиме /group для одной общей расшифровки."""
+
+    session_id: str
+    items: list[MediaSource] = field(default_factory=list)
+    panel_message_id: int | None = None
+    timer: asyncio.Task[None] | None = None
+
+    @property
+    def duration(self) -> int:
+        return sum(item.duration for item in self.items)
+
+
+class GroupCollector:
+    """Копит присланные записи и показывает кнопку только после паузы в отправке."""
+
+    def __init__(self, bot: Bot, settings: Settings) -> None:
+        self._bot = bot
+        self._settings = settings
+        self._sessions: dict[tuple[int, int], GroupSession] = {}
+
+    def open(self, chat_id: int, user_id: int) -> GroupSession:
+        self.discard(chat_id, user_id)
+        session = GroupSession(session_id=uuid.uuid4().hex[:8])
+        self._sessions[(chat_id, user_id)] = session
+        return session
+
+    def get(self, chat_id: int, user_id: int) -> GroupSession | None:
+        return self._sessions.get((chat_id, user_id))
+
+    def discard(self, chat_id: int, user_id: int) -> GroupSession | None:
+        session = self._sessions.pop((chat_id, user_id), None)
+        if session and session.timer:
+            session.timer.cancel()
+        return session
+
+    def shutdown(self) -> None:
+        for session in self._sessions.values():
+            if session.timer:
+                session.timer.cancel()
+        self._sessions.clear()
+
+    async def add(self, message: Message, media: MediaSource) -> bool:
+        """Кладёт запись в открытую сессию. False — режим группы не включён."""
+        chat_id, user_id = message.chat.id, message.from_user.id
+        session = self._sessions.get((chat_id, user_id))
+        if session is None:
+            return False
+
+        if len(session.items) >= self._settings.max_group_items:
+            await message.answer(
+                f"Собрано максимум записей ({self._settings.max_group_items}). "
+                "Нажмите кнопку расшифровки или /cancel."
+            )
+            return True
+
+        session.items.append(media)
+        with contextlib.suppress(TelegramAPIError):
+            await self._bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=message.message_id,
+                reaction=[ReactionTypeEmoji(emoji="👍")],
+            )
+
+        if session.timer:
+            session.timer.cancel()
+        session.timer = asyncio.create_task(self._show_panel_later(chat_id, session))
+        return True
+
+    async def _show_panel_later(self, chat_id: int, session: GroupSession) -> None:
+        try:
+            await asyncio.sleep(self._settings.group_debounce_seconds)
+            await self._show_panel(chat_id, session)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - сбой панели не должен ломать сессию
+            logger.exception("Не удалось показать панель группы")
+
+    async def _show_panel(self, chat_id: int, session: GroupSession) -> None:
+        text = (
+            f"🎙 Собрано записей: {len(session.items)} · {format_hms(session.duration)}\n"
+            "Пришлите ещё или расшифруйте всё одним файлом."
+        )
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="📄 Расшифровать в единый файл",
+                        callback_data=f"grp:go:{session.session_id}",
+                    )
+                ],
+                [InlineKeyboardButton(text="✖️ Отмена", callback_data=f"grp:cancel:{session.session_id}")],
+            ]
+        )
+
+        # Прошлую панель убираем, чтобы кнопка всегда оставалась последним сообщением
+        if session.panel_message_id:
+            with contextlib.suppress(TelegramAPIError):
+                await self._bot.delete_message(chat_id=chat_id, message_id=session.panel_message_id)
+            session.panel_message_id = None
+
+        panel = await self._bot.send_message(chat_id, text, reply_markup=keyboard)
+        session.panel_message_id = panel.message_id
 
 
 class Status:
@@ -261,14 +378,16 @@ class JobQueue:
             else:
                 prepared = await self._fetch_audio(job, meta, workdir, status)
                 if not meta.duration:
-                    meta.duration = int(prepared.duration)
+                    meta.duration = int(sum(item.duration for item in prepared))
                     self._check_duration(meta.duration)
                 text = await self._run_transcription(prepared, meta, status)
                 await asyncio.to_thread(transcript_path.write_text, text, encoding="utf-8")
 
             elapsed = format_hms(time.monotonic() - started)
             await status.set(f"{meta.header()}\n\n✅ Готово за {elapsed}")
-            await self._send_transcript(job.chat_id, meta.title, text, meta.token)
+            await self._send_transcript(
+                job.chat_id, meta.title, text, meta.token, as_document=bool(job.batch)
+            )
 
         except (AudioError, TranscriptionError) as exc:
             await status.set(f"❌ {html.escape(str(exc))}")
@@ -276,6 +395,17 @@ class JobQueue:
             await asyncio.to_thread(shutil.rmtree, workdir, True)
 
     async def _resolve_meta(self, job: Job, status: Status) -> Meta:
+        if job.batch:
+            duration = sum(item.duration for item in job.batch)
+            self._check_duration(duration)
+            digest = hashlib.sha1("|".join(item.unique_id for item in job.batch).encode()).hexdigest()
+            return Meta(
+                title=f"Группа из {len(job.batch)} записей",
+                duration=duration,
+                token=self._token(f"g{digest[:24]}"),
+                icon="🎙",
+            )
+
         if job.media:
             self._check_duration(job.media.duration)
             return Meta(
@@ -307,19 +437,26 @@ class JobQueue:
                 f"{self._settings.max_video_minutes} мин. Обработка отменена."
             )
 
-    async def _fetch_audio(self, job: Job, meta: Meta, workdir: Path, status: Status) -> PreparedAudio:
+    async def _fetch_audio(self, job: Job, meta: Meta, workdir: Path, status: Status) -> list[PreparedAudio]:
         header = meta.header()
+        items = job.items
 
-        if job.media:
-            await status.set(f"{header}\n\n⬇️ Забираю файл из Telegram…")
-            source = await self._download_media(job.media, workdir)
-            await status.set(f"{header}\n\n🎚 Извлекаю звук…")
-            return await prepare_audio_file(source, workdir)
+        if items:
+            prepared: list[PreparedAudio] = []
+            for number, media in enumerate(items, start=1):
+                counter = f" ({number}/{len(items)})" if len(items) > 1 else ""
+                await status.set(f"{header}\n\n⬇️ Забираю файл из Telegram…{counter}")
+                part_dir = workdir / f"part{number:03d}"
+                part_dir.mkdir(parents=True, exist_ok=True)
+                source = await self._download_media(media, part_dir)
+                await status.set(f"{header}\n\n🎚 Извлекаю звук…{counter}")
+                prepared.append(await prepare_audio_file(source, part_dir))
+            return prepared
 
         progress = Progress()
         await status.set(f"{header}\n\n⬇️ Скачиваю аудио…")
         async with periodic(lambda: status.set(f"{header}\n\n⬇️ Скачиваю аудио…{progress.as_suffix()}")):
-            return await prepare_youtube_audio(job.url or "", workdir, self._settings, progress)
+            return [await prepare_youtube_audio(job.url or "", workdir, self._settings, progress)]
 
     async def _download_media(self, media: MediaSource, workdir: Path) -> Path:
         destination = workdir / f"source{media.suffix}"
@@ -338,8 +475,9 @@ class JobQueue:
             raise AudioError("Файл из Telegram скачался пустым, попробуйте отправить его заново.")
         return destination
 
-    async def _run_transcription(self, prepared: PreparedAudio, meta: Meta, status: Status) -> str:
-        total = len(prepared.chunks)
+    async def _run_transcription(self, prepared: list[PreparedAudio], meta: Meta, status: Status) -> str:
+        groups = [item.chunks for item in prepared]
+        total = sum(len(group) for group in groups)
         state = {"done": 0}
 
         def note(done: int, _total: int) -> None:
@@ -349,15 +487,33 @@ class JobQueue:
             header = meta.header()
             if total == 1:
                 return f"{header}\n\n🧠 Расшифровываю…"
-            return f"{header}\n\n🧠 Расшифровываю: {state['done']}/{total} частей"
+            return f"{header}\n\n🧠 Расшифровываю: {state['done']}/{total} фрагментов"
 
         await status.set(transcribe_status())
         async with periodic(lambda: status.set(transcribe_status())):
-            return await self._transcriber.transcribe(prepared.chunks, on_progress=note)
+            texts = await self._transcriber.transcribe_groups(groups, on_progress=note)
 
-    async def _send_transcript(self, chat_id: int, title: str, text: str, token: str) -> None:
+        if len(texts) == 1:
+            if not texts[0]:
+                raise TranscriptionError("Модель вернула пустую расшифровку — возможно, здесь нет речи.")
+            return texts[0]
+
+        blocks = []
+        for number, (item, text) in enumerate(zip(prepared, texts, strict=True), start=1):
+            label = f"[Запись {number} · {format_hms(item.duration)}]"
+            blocks.append(f"{label}\n{text}" if text else f"{label}\n(речь не распознана)")
+        return "\n\n".join(blocks)
+
+    async def _send_transcript(
+        self,
+        chat_id: int,
+        title: str,
+        text: str,
+        token: str,
+        as_document: bool = False,
+    ) -> None:
         keyboard = summary_keyboard(token)
-        if len(text) <= MESSAGE_TEXT_LIMIT:
+        if not as_document and len(text) <= MESSAGE_TEXT_LIMIT:
             await self._bot.send_message(chat_id, text, parse_mode=None, reply_markup=keyboard)
             return
 
@@ -388,13 +544,15 @@ async def cmd_id(message: Message) -> None:
 
 async def _enqueue(
     message: Message,
+    user_id: int,
     settings: Settings,
     queue: JobQueue,
     *,
     url: str | None = None,
     media: MediaSource | None = None,
+    batch: list[MediaSource] | None = None,
 ) -> None:
-    if queue.jobs_of(message.from_user.id) >= MAX_JOBS_PER_USER:
+    if queue.jobs_of(user_id) >= MAX_JOBS_PER_USER:
         await message.answer(f"У вас уже {MAX_JOBS_PER_USER} задачи в работе. Дождитесь их завершения.")
         return
 
@@ -402,10 +560,11 @@ async def _enqueue(
     position = await queue.submit(
         Job(
             chat_id=message.chat.id,
-            user_id=message.from_user.id,
+            user_id=user_id,
             status_message_id=status_message.message_id,
             url=url,
             media=media,
+            batch=batch,
         )
     )
     if position > settings.workers:
@@ -413,8 +572,41 @@ async def _enqueue(
             await status_message.edit_text(f"⏳ В очереди, позиция {position}")
 
 
+@router.message(Command("group"))
+async def cmd_group(message: Message, settings: Settings, collector: GroupCollector) -> None:
+    if not settings.is_allowed(message.from_user.id):
+        await message.answer("Нет доступа. Попросите владельца бота добавить ваш ID из /id в ALLOWED_USER_IDS.")
+        return
+
+    collector.open(message.chat.id, message.from_user.id)
+    await message.answer(
+        "🎙 Режим группы включён. Присылайте голосовые или файлы — я отмечу каждое "
+        f"реакцией и через {settings.group_debounce_seconds:g} с после последнего покажу кнопку "
+        "«Расшифровать в единый файл».\n\n"
+        "Выйти без обработки: /cancel"
+    )
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, collector: GroupCollector) -> None:
+    session = collector.discard(message.chat.id, message.from_user.id)
+    if session and session.panel_message_id:
+        with contextlib.suppress(TelegramAPIError):
+            await message.bot.delete_message(chat_id=message.chat.id, message_id=session.panel_message_id)
+
+    if session:
+        await message.answer(f"Режим группы выключен, забыто записей: {len(session.items)}.")
+    else:
+        await message.answer("Режим группы не включён. Включить — /group")
+
+
 @router.message(F.video | F.audio | F.voice | F.video_note | F.document)
-async def handle_media(message: Message, settings: Settings, queue: JobQueue) -> None:
+async def handle_media(
+    message: Message,
+    settings: Settings,
+    queue: JobQueue,
+    collector: GroupCollector,
+) -> None:
     if not settings.is_allowed(message.from_user.id):
         await message.answer("Нет доступа. Попросите владельца бота добавить ваш ID из /id в ALLOWED_USER_IDS.")
         return
@@ -437,7 +629,10 @@ async def handle_media(message: Message, settings: Settings, queue: JobQueue) ->
         )
         return
 
-    await _enqueue(message, settings, queue, media=media)
+    if await collector.add(message, media):
+        return
+
+    await _enqueue(message, message.from_user.id, settings, queue, media=media)
 
 
 @router.message(F.text)
@@ -454,7 +649,65 @@ async def handle_link(message: Message, settings: Settings, queue: JobQueue) -> 
         )
         return
 
-    await _enqueue(message, settings, queue, url=url)
+    await _enqueue(message, message.from_user.id, settings, queue, url=url)
+
+
+@router.callback_query(F.data.startswith("grp:"), F.message)
+async def handle_group_action(
+    callback: CallbackQuery,
+    settings: Settings,
+    queue: JobQueue,
+    collector: GroupCollector,
+) -> None:
+    if not settings.is_allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректный запрос", show_alert=True)
+        return
+
+    _, action, session_id = parts
+    chat_id = callback.message.chat.id
+    message_id = callback.message.message_id
+    session = collector.get(chat_id, callback.from_user.id)
+
+    if session is None or session.session_id != session_id or not session.items:
+        await callback.answer("Эта группа уже обработана или устарела", show_alert=True)
+        with contextlib.suppress(TelegramAPIError):
+            await callback.bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
+        return
+
+    if action == "cancel":
+        collector.discard(chat_id, callback.from_user.id)
+        await callback.answer("Группа отменена")
+        with contextlib.suppress(TelegramAPIError):
+            await callback.bot.edit_message_text(
+                f"✖️ Режим группы выключен, забыто записей: {len(session.items)}.",
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+        return
+
+    # Сессию закрываем только когда задача точно уйдёт в очередь, иначе собранное потеряется
+    if queue.jobs_of(callback.from_user.id) >= MAX_JOBS_PER_USER:
+        await callback.answer(
+            f"У вас уже {MAX_JOBS_PER_USER} задачи в работе. Дождитесь их и нажмите кнопку снова.",
+            show_alert=True,
+        )
+        return
+
+    collector.discard(chat_id, callback.from_user.id)
+    await callback.answer("Отправляю в обработку")
+    with contextlib.suppress(TelegramAPIError):
+        await callback.bot.edit_message_text(
+            f"🎙 Группа из {len(session.items)} записей · {format_hms(session.duration)}",
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+
+    await _enqueue(callback.message, callback.from_user.id, settings, queue, batch=session.items)
 
 
 @router.callback_query(F.data.startswith("sum:"), F.message)
@@ -518,10 +771,16 @@ async def run(settings: Settings) -> None:
     )
     transcriber = Transcriber(settings)
     queue = JobQueue(bot, settings, transcriber)
+    collector = GroupCollector(bot, settings)
 
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
-    dispatcher.workflow_data.update(settings=settings, queue=queue, transcriber=transcriber)
+    dispatcher.workflow_data.update(
+        settings=settings,
+        queue=queue,
+        transcriber=transcriber,
+        collector=collector,
+    )
 
     await asyncio.to_thread(_clean_tmp, settings.tmp_dir)
     queue.start()
@@ -532,6 +791,7 @@ async def run(settings: Settings) -> None:
     try:
         await dispatcher.start_polling(bot, drop_pending_updates=True)
     finally:
+        collector.shutdown()
         await queue.stop()
         await transcriber.close()
         await bot.session.close()

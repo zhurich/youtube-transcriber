@@ -71,8 +71,23 @@ class Transcriber:
         chunks: Sequence[AudioChunk],
         on_progress: Callable[[int, int], None] | None = None,
     ) -> str:
+        texts = await self.transcribe_groups([chunks], on_progress=on_progress)
+        if not texts[0]:
+            raise TranscriptionError("Модель вернула пустую расшифровку — возможно, в видео нет речи.")
+        return texts[0]
+
+    async def transcribe_groups(
+        self,
+        groups: Sequence[Sequence[AudioChunk]],
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> list[str]:
+        """Расшифровывает несколько записей одним пакетом, возвращая текст каждой отдельно.
+
+        Все части всех записей идут в OpenAI через общий семафор, поэтому пакет из
+        коротких голосовых обрабатывается так же параллельно, как одно длинное видео.
+        """
         done = 0
-        total = len(chunks)
+        total = sum(len(group) for group in groups)
         lock = asyncio.Lock()
 
         async def run(chunk: AudioChunk) -> str:
@@ -86,15 +101,21 @@ class Transcriber:
             return text
 
         try:
-            results = await asyncio.gather(*(run(chunk) for chunk in chunks))
+            results = await asyncio.gather(*(run(chunk) for group in groups for chunk in group))
         except OpenAIError as exc:
             logger.exception("Транскрибация не удалась")
             raise TranscriptionError(_humanize_api_error(exc)) from exc
 
-        joined = "\n\n".join(part for part in results if part).strip()
-        if not joined:
-            raise TranscriptionError("Модель вернула пустую расшифровку — возможно, в видео нет речи.")
-        return joined
+        texts: list[str] = []
+        position = 0
+        for group in groups:
+            parts = results[position : position + len(group)]
+            texts.append("\n\n".join(part for part in parts if part).strip())
+            position += len(group)
+
+        if not any(texts):
+            raise TranscriptionError("Модель вернула пустую расшифровку — возможно, в записях нет речи.")
+        return texts
 
     async def _transcribe_chunk(self, chunk: AudioChunk) -> str:
         data = await asyncio.to_thread(chunk.path.read_bytes)

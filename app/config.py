@@ -25,6 +25,16 @@ def _env_int(name: str, default: int) -> int:
         raise ValueError(f"{name} должен быть целым числом, получено: {raw!r}") from exc
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = _env_str(name)
+    if not raw:
+        return default
+    try:
+        return float(raw.replace(",", "."))
+    except ValueError as exc:
+        raise ValueError(f"{name} должен быть числом, получено: {raw!r}") from exc
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = _env_str(name).lower()
     if not raw:
@@ -55,6 +65,8 @@ class Settings:
     yt_proxy: str
     telegram_api_url: str
     max_file_mb: int
+    group_debounce_seconds: float
+    max_group_items: int
     log_level: str
     data_dir: Path
 
@@ -102,6 +114,8 @@ def load_settings() -> Settings:
         telegram_api_url=_env_str("TELEGRAM_API_URL").rstrip("/"),
         # Публичный Bot API не отдаёт боту файлы больше 20 МБ, локальный сервер — до 2000 МБ
         max_file_mb=_env_int("MAX_FILE_MB", 2000 if _env_str("TELEGRAM_API_URL") else 20),
+        group_debounce_seconds=max(0.5, _env_float("GROUP_DEBOUNCE_SECONDS", 4.0)),
+        max_group_items=max(2, _env_int("MAX_GROUP_ITEMS", 50)),
         log_level=_env_str("LOG_LEVEL", "INFO").upper(),
         data_dir=data_dir,
     )
