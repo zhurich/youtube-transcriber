@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import html
 import logging
+import mimetypes
 import re
 import shutil
 import time
@@ -13,6 +14,8 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
@@ -26,12 +29,14 @@ from aiogram.types import (
 
 from app.audio import (
     AudioError,
+    PreparedAudio,
     Progress,
     check_js_runtime,
     ensure_ffmpeg,
     find_youtube_url,
     get_video_info,
-    prepare_audio,
+    prepare_audio_file,
+    prepare_youtube_audio,
 )
 from app.config import Settings
 from app.transcriber import Transcriber, TranscriptionError
@@ -45,9 +50,17 @@ MESSAGE_TEXT_LIMIT = 3500
 MAX_JOBS_PER_USER = 3
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
+MEDIA_EXTENSIONS = frozenset(
+    {
+        ".3gp", ".aac", ".avi", ".flac", ".m4a", ".m4v", ".mkv", ".mov", ".mp3", ".mp4",
+        ".mpeg", ".mpg", ".oga", ".ogg", ".ogv", ".opus", ".wav", ".webm", ".wma",
+    }
+)
+
 HELP_TEXT = (
-    "Пришлите ссылку на видео с YouTube — я скачаю звук, расшифрую его через OpenAI "
-    "и верну текст. Под расшифровкой будет кнопка для краткого конспекта.\n\n"
+    "Пришлите ссылку на видео с YouTube или сам файл — видео, аудио, голосовое "
+    "или видеосообщение. Я извлеку звук, расшифрую его через OpenAI и верну текст. "
+    "Под расшифровкой будет кнопка для краткого конспекта.\n\n"
     "Команды:\n"
     "/help — эта справка\n"
     "/id — ваш Telegram ID (нужен для списка доступа)"
@@ -55,11 +68,103 @@ HELP_TEXT = (
 
 
 @dataclass
+class MediaSource:
+    """Видео или аудио, присланное в Telegram."""
+
+    file_id: str
+    unique_id: str
+    title: str
+    duration: int
+    file_size: int
+    suffix: str
+
+
+@dataclass
 class Job:
-    url: str
     chat_id: int
     user_id: int
     status_message_id: int
+    url: str | None = None
+    media: MediaSource | None = None
+
+
+@dataclass
+class Meta:
+    """Что показываем пользователю и под каким ключом кэшируем расшифровку."""
+
+    title: str
+    duration: int
+    token: str
+    icon: str
+
+    def header(self) -> str:
+        head = f"{self.icon} <b>{html.escape(self.title)}</b>"
+        return f"{head}\n⏱ {format_hms(self.duration)}" if self.duration else head
+
+
+def extract_media(message: Message) -> MediaSource | None:
+    if message.video:
+        video = message.video
+        return MediaSource(
+            file_id=video.file_id,
+            unique_id=video.file_unique_id,
+            title=video.file_name or "Видео из Telegram",
+            duration=video.duration or 0,
+            file_size=video.file_size or 0,
+            suffix=Path(video.file_name or "").suffix or ".mp4",
+        )
+
+    if message.audio:
+        audio = message.audio
+        name = " — ".join(part for part in (audio.performer, audio.title) if part)
+        return MediaSource(
+            file_id=audio.file_id,
+            unique_id=audio.file_unique_id,
+            title=name or audio.file_name or "Аудио из Telegram",
+            duration=audio.duration or 0,
+            file_size=audio.file_size or 0,
+            suffix=Path(audio.file_name or "").suffix or ".mp3",
+        )
+
+    if message.voice:
+        voice = message.voice
+        return MediaSource(
+            file_id=voice.file_id,
+            unique_id=voice.file_unique_id,
+            title="Голосовое сообщение",
+            duration=voice.duration or 0,
+            file_size=voice.file_size or 0,
+            suffix=".ogg",
+        )
+
+    if message.video_note:
+        note = message.video_note
+        return MediaSource(
+            file_id=note.file_id,
+            unique_id=note.file_unique_id,
+            title="Видеосообщение",
+            duration=note.duration or 0,
+            file_size=note.file_size or 0,
+            suffix=".mp4",
+        )
+
+    document = message.document
+    if document:
+        mime = document.mime_type or ""
+        suffix = Path(document.file_name or "").suffix.lower()
+        if not suffix and mime:
+            suffix = mimetypes.guess_extension(mime) or ""
+        if mime.startswith(("video/", "audio/")) or suffix in MEDIA_EXTENSIONS:
+            return MediaSource(
+                file_id=document.file_id,
+                unique_id=document.file_unique_id,
+                title=document.file_name or "Файл из Telegram",
+                duration=0,
+                file_size=document.file_size or 0,
+                suffix=suffix or ".bin",
+            )
+
+    return None
 
 
 class Status:
@@ -147,58 +252,108 @@ class JobQueue:
         workdir.mkdir(parents=True, exist_ok=True)
 
         try:
-            await status.set("🔎 Читаю информацию о видео…")
-            info = await get_video_info(job.url, self._settings)
-
-            limit = self._settings.max_video_minutes * 60
-            if limit and info.duration > limit:
-                await status.set(
-                    f"❌ Видео длиннее {self._settings.max_video_minutes} мин "
-                    f"({format_hms(info.duration)}). Обработка отменена."
-                )
-                return
-
-            title = html.escape(info.title)
-            header = f"🎬 <b>{title}</b>\n⏱ {format_hms(info.duration)}"
-            token = info.video_id or uuid.uuid4().hex
-            if self._settings.timestamps:
-                token = f"{token}_ts"
-            transcript_path = self._settings.transcripts_dir / f"{token}.txt"
+            meta = await self._resolve_meta(job, status)
+            transcript_path = self._settings.transcripts_dir / f"{meta.token}.txt"
 
             if transcript_path.exists():
-                await status.set(f"{header}\n\n♻️ Нашёл готовую расшифровку в кэше.")
+                await status.set(f"{meta.header()}\n\n♻️ Нашёл готовую расшифровку в кэше.")
                 text = await asyncio.to_thread(transcript_path.read_text, encoding="utf-8")
             else:
-                progress = Progress()
-                await status.set(f"{header}\n\n⬇️ Скачиваю аудио…")
-                async with periodic(lambda: status.set(f"{header}\n\n⬇️ Скачиваю аудио…{progress.as_suffix()}")):
-                    prepared = await prepare_audio(job.url, workdir, self._settings, progress)
-
-                total = len(prepared.chunks)
-                state = {"done": 0}
-
-                def note(done: int, _total: int) -> None:
-                    state["done"] = done
-
-                def transcribe_status() -> str:
-                    if total == 1:
-                        return f"{header}\n\n🧠 Расшифровываю…"
-                    return f"{header}\n\n🧠 Расшифровываю: {state['done']}/{total} частей"
-
-                await status.set(transcribe_status())
-                async with periodic(lambda: status.set(transcribe_status())):
-                    text = await self._transcriber.transcribe(prepared.chunks, on_progress=note)
-
+                prepared = await self._fetch_audio(job, meta, workdir, status)
+                if not meta.duration:
+                    meta.duration = int(prepared.duration)
+                    self._check_duration(meta.duration)
+                text = await self._run_transcription(prepared, meta, status)
                 await asyncio.to_thread(transcript_path.write_text, text, encoding="utf-8")
 
             elapsed = format_hms(time.monotonic() - started)
-            await status.set(f"{header}\n\n✅ Готово за {elapsed}")
-            await self._send_transcript(job.chat_id, info.title, text, token)
+            await status.set(f"{meta.header()}\n\n✅ Готово за {elapsed}")
+            await self._send_transcript(job.chat_id, meta.title, text, meta.token)
 
         except (AudioError, TranscriptionError) as exc:
             await status.set(f"❌ {html.escape(str(exc))}")
         finally:
             await asyncio.to_thread(shutil.rmtree, workdir, True)
+
+    async def _resolve_meta(self, job: Job, status: Status) -> Meta:
+        if job.media:
+            self._check_duration(job.media.duration)
+            return Meta(
+                title=job.media.title,
+                duration=job.media.duration,
+                token=self._token(job.media.unique_id),
+                icon="🎧",
+            )
+
+        await status.set("🔎 Читаю информацию о видео…")
+        info = await get_video_info(job.url or "", self._settings)
+        self._check_duration(info.duration)
+        return Meta(
+            title=info.title,
+            duration=info.duration,
+            token=self._token(info.video_id or uuid.uuid4().hex),
+            icon="🎬",
+        )
+
+    def _token(self, base: str) -> str:
+        clean = re.sub(r"[^A-Za-z0-9_-]", "", base)[:32] or uuid.uuid4().hex
+        return f"{clean}_ts" if self._settings.timestamps else clean
+
+    def _check_duration(self, duration: int) -> None:
+        limit = self._settings.max_video_minutes * 60
+        if limit and duration > limit:
+            raise AudioError(
+                f"Длительность {format_hms(duration)} больше лимита "
+                f"{self._settings.max_video_minutes} мин. Обработка отменена."
+            )
+
+    async def _fetch_audio(self, job: Job, meta: Meta, workdir: Path, status: Status) -> PreparedAudio:
+        header = meta.header()
+
+        if job.media:
+            await status.set(f"{header}\n\n⬇️ Забираю файл из Telegram…")
+            source = await self._download_media(job.media, workdir)
+            await status.set(f"{header}\n\n🎚 Извлекаю звук…")
+            return await prepare_audio_file(source, workdir)
+
+        progress = Progress()
+        await status.set(f"{header}\n\n⬇️ Скачиваю аудио…")
+        async with periodic(lambda: status.set(f"{header}\n\n⬇️ Скачиваю аудио…{progress.as_suffix()}")):
+            return await prepare_youtube_audio(job.url or "", workdir, self._settings, progress)
+
+    async def _download_media(self, media: MediaSource, workdir: Path) -> Path:
+        destination = workdir / f"source{media.suffix}"
+        try:
+            await self._bot.download(media.file_id, destination=destination, timeout=1800)
+        except TelegramAPIError as exc:
+            message = str(exc)
+            if "too big" in message.lower():
+                raise AudioError(
+                    f"Telegram не отдаёт боту файлы больше {self._settings.max_file_mb} МБ. "
+                    "Пришлите ссылку на YouTube или настройте локальный Bot API сервер."
+                ) from exc
+            raise AudioError(f"Не удалось скачать файл из Telegram: {message}") from exc
+
+        if not destination.exists() or destination.stat().st_size == 0:
+            raise AudioError("Файл из Telegram скачался пустым, попробуйте отправить его заново.")
+        return destination
+
+    async def _run_transcription(self, prepared: PreparedAudio, meta: Meta, status: Status) -> str:
+        total = len(prepared.chunks)
+        state = {"done": 0}
+
+        def note(done: int, _total: int) -> None:
+            state["done"] = done
+
+        def transcribe_status() -> str:
+            header = meta.header()
+            if total == 1:
+                return f"{header}\n\n🧠 Расшифровываю…"
+            return f"{header}\n\n🧠 Расшифровываю: {state['done']}/{total} частей"
+
+        await status.set(transcribe_status())
+        async with periodic(lambda: status.set(transcribe_status())):
+            return await self._transcriber.transcribe(prepared.chunks, on_progress=note)
 
     async def _send_transcript(self, chat_id: int, title: str, text: str, token: str) -> None:
         keyboard = summary_keyboard(token)
@@ -231,6 +386,60 @@ async def cmd_id(message: Message) -> None:
     await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
 
 
+async def _enqueue(
+    message: Message,
+    settings: Settings,
+    queue: JobQueue,
+    *,
+    url: str | None = None,
+    media: MediaSource | None = None,
+) -> None:
+    if queue.jobs_of(message.from_user.id) >= MAX_JOBS_PER_USER:
+        await message.answer(f"У вас уже {MAX_JOBS_PER_USER} задачи в работе. Дождитесь их завершения.")
+        return
+
+    status_message = await message.answer("⏳ Задача принята…")
+    position = await queue.submit(
+        Job(
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+            status_message_id=status_message.message_id,
+            url=url,
+            media=media,
+        )
+    )
+    if position > settings.workers:
+        with contextlib.suppress(TelegramBadRequest):
+            await status_message.edit_text(f"⏳ В очереди, позиция {position}")
+
+
+@router.message(F.video | F.audio | F.voice | F.video_note | F.document)
+async def handle_media(message: Message, settings: Settings, queue: JobQueue) -> None:
+    if not settings.is_allowed(message.from_user.id):
+        await message.answer("Нет доступа. Попросите владельца бота добавить ваш ID из /id в ALLOWED_USER_IDS.")
+        return
+
+    media = extract_media(message)
+    if media is None:
+        await message.answer("Этот файл не похож на видео или аудио. Пришлите медиафайл или ссылку на YouTube.")
+        return
+
+    if media.file_size > settings.max_file_bytes:
+        size_mb = media.file_size / 1024 / 1024
+        hint = (
+            "Загрузите видео на YouTube и пришлите ссылку"
+            if not settings.telegram_api_url
+            else "Уменьшите файл или поднимите MAX_FILE_MB"
+        )
+        await message.answer(
+            f"Файл весит {size_mb:.0f} МБ, а бот может скачать не больше "
+            f"{settings.max_file_mb} МБ. {hint}."
+        )
+        return
+
+    await _enqueue(message, settings, queue, media=media)
+
+
 @router.message(F.text)
 async def handle_link(message: Message, settings: Settings, queue: JobQueue) -> None:
     if not settings.is_allowed(message.from_user.id):
@@ -239,25 +448,13 @@ async def handle_link(message: Message, settings: Settings, queue: JobQueue) -> 
 
     url = find_youtube_url(message.text)
     if not url:
-        await message.answer("Не вижу ссылку на YouTube. Пришлите ссылку вида https://youtu.be/…")
-        return
-
-    if queue.jobs_of(message.from_user.id) >= MAX_JOBS_PER_USER:
-        await message.answer(f"У вас уже {MAX_JOBS_PER_USER} задачи в работе. Дождитесь их завершения.")
-        return
-
-    status_message = await message.answer("⏳ Задача принята…")
-    position = await queue.submit(
-        Job(
-            url=url,
-            chat_id=message.chat.id,
-            user_id=message.from_user.id,
-            status_message_id=status_message.message_id,
+        await message.answer(
+            "Не вижу ссылку на YouTube. Пришлите ссылку вида https://youtu.be/… "
+            "или отправьте видео либо аудио файлом."
         )
-    )
-    if position > settings.workers:
-        with contextlib.suppress(TelegramBadRequest):
-            await status_message.edit_text(f"⏳ В очереди, позиция {position}")
+        return
+
+    await _enqueue(message, settings, queue, url=url)
 
 
 @router.callback_query(F.data.startswith("sum:"), F.message)
@@ -308,7 +505,17 @@ async def run(settings: Settings) -> None:
     ensure_ffmpeg()
     check_js_runtime()
 
-    bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    session = None
+    if settings.telegram_api_url:
+        # Локальный telegram-bot-api отдаёт файлы до 2 ГБ и кладёт их прямо на диск
+        session = AiohttpSession(api=TelegramAPIServer.from_base(settings.telegram_api_url, is_local=True))
+        logger.info("Использую локальный Bot API: %s", settings.telegram_api_url)
+
+    bot = Bot(
+        token=settings.bot_token,
+        session=session,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
     transcriber = Transcriber(settings)
     queue = JobQueue(bot, settings, transcriber)
 

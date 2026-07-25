@@ -53,6 +53,8 @@ class Settings:
     transcribe_concurrency: int
     yt_cookies_file: str
     yt_proxy: str
+    telegram_api_url: str
+    max_file_mb: int
     log_level: str
     data_dir: Path
 
@@ -63,6 +65,10 @@ class Settings:
     @property
     def tmp_dir(self) -> Path:
         return self.data_dir / "tmp"
+
+    @property
+    def max_file_bytes(self) -> int:
+        return self.max_file_mb * 1024 * 1024
 
     def is_allowed(self, user_id: int) -> bool:
         return not self.allowed_user_ids or user_id in self.allowed_user_ids
@@ -93,6 +99,9 @@ def load_settings() -> Settings:
         transcribe_concurrency=max(1, _env_int("TRANSCRIBE_CONCURRENCY", 3)),
         yt_cookies_file=_env_str("YT_COOKIES_FILE"),
         yt_proxy=_env_str("YT_PROXY"),
+        telegram_api_url=_env_str("TELEGRAM_API_URL").rstrip("/"),
+        # Публичный Bot API не отдаёт боту файлы больше 20 МБ, локальный сервер — до 2000 МБ
+        max_file_mb=_env_int("MAX_FILE_MB", 2000 if _env_str("TELEGRAM_API_URL") else 20),
         log_level=_env_str("LOG_LEVEL", "INFO").upper(),
         data_dir=data_dir,
     )

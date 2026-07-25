@@ -57,6 +57,7 @@ class AudioChunk:
 @dataclass
 class PreparedAudio:
     chunks: list[AudioChunk] = field(default_factory=list)
+    duration: float = 0.0
 
 
 def find_youtube_url(text: str) -> str | None:
@@ -187,7 +188,7 @@ async def _run(*args: str) -> None:
         raise AudioError(f"Ошибка ffmpeg: {detail[-1] if detail else 'неизвестная ошибка'}")
 
 
-async def _probe_duration(path: Path) -> float:
+async def probe_duration(path: Path) -> float:
     process = await asyncio.create_subprocess_exec(
         "ffprobe",
         "-v",
@@ -207,8 +208,10 @@ async def _probe_duration(path: Path) -> float:
         return 0.0
 
 
-async def prepare_audio(url: str, workdir: Path, settings: Settings, progress: Progress) -> PreparedAudio:
-    """Скачивает аудиодорожку, приводит к mp3 16 кГц моно и при необходимости режет на части."""
+async def prepare_youtube_audio(
+    url: str, workdir: Path, settings: Settings, progress: Progress
+) -> PreparedAudio:
+    """Скачивает аудиодорожку с YouTube и готовит её к отправке в OpenAI."""
     try:
         source = await asyncio.to_thread(_download, url, workdir, settings, progress)
     except AudioError:
@@ -219,6 +222,11 @@ async def prepare_audio(url: str, workdir: Path, settings: Settings, progress: P
         logger.exception("Не удалось скачать аудио")
         raise AudioError(_humanize_download_error(exc)) from exc
 
+    return await prepare_audio_file(source, workdir)
+
+
+async def prepare_audio_file(source: Path, workdir: Path) -> PreparedAudio:
+    """Извлекает звук в mp3 16 кГц моно и при необходимости режет на части по лимиту OpenAI."""
     audio = workdir / "audio.mp3"
     await _run(
         "ffmpeg",
@@ -241,8 +249,10 @@ async def prepare_audio(url: str, workdir: Path, settings: Settings, progress: P
     )
     source.unlink(missing_ok=True)
 
+    duration = await probe_duration(audio)
+
     if audio.stat().st_size <= SINGLE_FILE_LIMIT_BYTES:
-        return PreparedAudio(chunks=[AudioChunk(path=audio, offset=0.0)])
+        return PreparedAudio(chunks=[AudioChunk(path=audio, offset=0.0)], duration=duration)
 
     chunks_dir = workdir / "chunks"
     chunks_dir.mkdir(exist_ok=True)
@@ -271,7 +281,7 @@ async def prepare_audio(url: str, workdir: Path, settings: Settings, progress: P
     offset = 0.0
     for path in paths:
         chunks.append(AudioChunk(path=path, offset=offset))
-        offset += await _probe_duration(path)
+        offset += await probe_duration(path)
 
     audio.unlink(missing_ok=True)
-    return PreparedAudio(chunks=chunks)
+    return PreparedAudio(chunks=chunks, duration=duration or offset)
