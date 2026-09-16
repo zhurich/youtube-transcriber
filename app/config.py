@@ -61,10 +61,16 @@ class Settings:
     max_video_minutes: int
     workers: int
     transcribe_concurrency: int
+    cookies_file: str
     yt_cookies_file: str
+    instagram_cookies_file: str
+    vk_cookies_file: str
+    tiktok_cookies_file: str
     yt_proxy: str
     telegram_api_url: str
     max_file_mb: int
+    max_upload_mb: int
+    max_download_height: int
     group_debounce_seconds: float
     max_group_items: int
     log_level: str
@@ -79,8 +85,26 @@ class Settings:
         return self.data_dir / "tmp"
 
     @property
+    def links_dir(self) -> Path:
+        return self.data_dir / "links"
+
+    def cookies_for(self, platform_key: str) -> str:
+        """Cookies конкретной площадки, иначе общий файл для всех сразу."""
+        specific = {
+            "yt": self.yt_cookies_file,
+            "ig": self.instagram_cookies_file,
+            "vk": self.vk_cookies_file,
+            "tt": self.tiktok_cookies_file,
+        }.get(platform_key, "")
+        return specific or self.cookies_file
+
+    @property
     def max_file_bytes(self) -> int:
         return self.max_file_mb * 1024 * 1024
+
+    @property
+    def max_upload_bytes(self) -> int:
+        return self.max_upload_mb * 1024 * 1024
 
     def is_allowed(self, user_id: int) -> bool:
         return not self.allowed_user_ids or user_id in self.allowed_user_ids
@@ -109,11 +133,18 @@ def load_settings() -> Settings:
         max_video_minutes=_env_int("MAX_VIDEO_MINUTES", 180),
         workers=max(1, _env_int("WORKERS", 1)),
         transcribe_concurrency=max(1, _env_int("TRANSCRIBE_CONCURRENCY", 3)),
+        cookies_file=_env_str("COOKIES_FILE"),
         yt_cookies_file=_env_str("YT_COOKIES_FILE"),
+        instagram_cookies_file=_env_str("INSTAGRAM_COOKIES_FILE"),
+        vk_cookies_file=_env_str("VK_COOKIES_FILE"),
+        tiktok_cookies_file=_env_str("TIKTOK_COOKIES_FILE"),
         yt_proxy=_env_str("YT_PROXY"),
         telegram_api_url=_env_str("TELEGRAM_API_URL").rstrip("/"),
         # Публичный Bot API не отдаёт боту файлы больше 20 МБ, локальный сервер — до 2000 МБ
         max_file_mb=_env_int("MAX_FILE_MB", 2000 if _env_str("TELEGRAM_API_URL") else 20),
+        # Обратно Telegram принимает от бота до 50 МБ, локальный сервер — до 2000 МБ
+        max_upload_mb=_env_int("MAX_UPLOAD_MB", 2000 if _env_str("TELEGRAM_API_URL") else 50),
+        max_download_height=max(144, _env_int("MAX_DOWNLOAD_HEIGHT", 720)),
         group_debounce_seconds=max(0.5, _env_float("GROUP_DEBOUNCE_SECONDS", 4.0)),
         max_group_items=max(2, _env_int("MAX_GROUP_ITEMS", 50)),
         log_level=_env_str("LOG_LEVEL", "INFO").upper(),
@@ -122,4 +153,5 @@ def load_settings() -> Settings:
 
     settings.transcripts_dir.mkdir(parents=True, exist_ok=True)
     settings.tmp_dir.mkdir(parents=True, exist_ok=True)
+    settings.links_dir.mkdir(parents=True, exist_ok=True)
     return settings
