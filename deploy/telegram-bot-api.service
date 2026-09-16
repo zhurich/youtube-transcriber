@@ -1,0 +1,35 @@
+[Unit]
+Description=Telegram Bot API local server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+# api_id/api_hash лежат отдельно от .env приложения и доступны только root
+EnvironmentFile=/etc/telegram-bot-api.env
+# --local снимает лимиты Bot API: отправка до 2000 МБ вместо 50 МБ.
+# Слушаем только 127.0.0.1: наружу этот порт выставлять нельзя, у сервера нет
+# собственной авторизации — кто достучался, тот и управляет ботом.
+ExecStart=/usr/local/bin/telegram-bot-api \
+  --local \
+  --api-id=${TELEGRAM_API_ID} \
+  --api-hash=${TELEGRAM_API_HASH} \
+  --http-ip-address=127.0.0.1 \
+  --http-port=__PORT__ \
+  --dir=__DATA_DIR__ \
+  --temp-dir=__DATA_DIR__/temp
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ReadWritePaths=__DATA_DIR__
+
+[Install]
+WantedBy=multi-user.target

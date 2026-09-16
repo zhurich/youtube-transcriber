@@ -20,6 +20,13 @@ AUDIO_BITRATE = "64k"
 CHUNK_SECONDS = 900
 SINGLE_FILE_LIMIT_BYTES = 20 * 1024 * 1024
 
+# После склейки контейнер mp4 добавляет заголовки поверх суммы дорожек
+CONTAINER_OVERHEAD = 0.97
+# Сколько от лимита отправки готовы отдать под звук, чтобы осталось на картинку
+AUDIO_BUDGET_SHARE = 0.35
+# Сортировочная заглушка для дорожек, размер которых площадка не сообщила
+SIZE_UNKNOWN = 1 << 60
+
 @dataclass(frozen=True)
 class Platform:
     """Площадка, с которой бот умеет работать через yt-dlp."""
@@ -115,12 +122,37 @@ class VideoInfo:
 
 
 @dataclass
+class FormatPick:
+    """Выбранное сочетание дорожек и то, чем за него пришлось заплатить."""
+
+    spec: str
+    quality: int
+    width: int
+    height: int
+    size: int
+    rank: int
+    downgraded: bool = False
+    best_quality: int = 0
+
+
+@dataclass
 class DownloadedVideo:
     path: Path
     title: str
     duration: int
     width: int
     height: int
+    quality: int = 0
+    downgraded: bool = False
+    best_quality: int = 0
+
+    @property
+    def quality_note(self) -> str:
+        if not self.quality:
+            return ""
+        if self.downgraded and self.best_quality:
+            return f"{self.quality}p (доступно {self.best_quality}p, но не влезало в лимит)"
+        return f"{self.quality}p"
 
 
 @dataclass
@@ -320,56 +352,197 @@ def _download(url: str, workdir: Path, settings: Settings, progress: Progress) -
     if downloads and downloads[0].get("filepath"):
         return Path(downloads[0]["filepath"])
 
-    candidates = sorted(workdir.glob("source.*"))
+    # .part — недокачанный огрызок, его нельзя принимать за готовый файл
+    candidates = sorted(p for p in workdir.glob("source.*") if p.suffix != ".part" and p.stat().st_size)
     if not candidates:
-        raise AudioError("Аудиодорожка скачалась, но файл не найден.")
+        raise AudioError("Аудиодорожка скачалась не полностью, попробуйте ещё раз.")
     return candidates[0]
 
 
+def _stream_size(fmt: dict, duration: float) -> int:
+    """Размер дорожки в байтах. Если площадка его не сообщила — считаем по битрейту."""
+    size = fmt.get("filesize") or fmt.get("filesize_approx") or 0
+    if not size:
+        rate = fmt.get("tbr") or fmt.get("vbr") or fmt.get("abr") or 0
+        if rate and duration:
+            size = rate * 1000 / 8 * duration
+    return int(size or 0)
+
+
+def _quality_of(fmt: dict) -> int:
+    """Качество дорожки как короткая сторона кадра.
+
+    Именно её имеют в виду, когда говорят «1080p»: вертикальное видео 1080x1920
+    и горизонтальное 1920x1080 — одно и то же качество, хотя height у них разный.
+    """
+    width, height = int(fmt.get("width") or 0), int(fmt.get("height") or 0)
+    return min(width, height) if width and height else height
+
+
+def _codec_rank(fmt: dict) -> int:
+    """H.264 Telegram играет прямо в чате на любом клиенте, остальное — как повезёт."""
+    vcodec = str(fmt.get("vcodec") or "")
+    if vcodec.startswith("avc1") or vcodec.startswith("h264"):
+        return 0
+    if vcodec.startswith(("vp9", "vp09")):
+        return 1
+    return 2
+
+
+def _has_video(fmt: dict) -> bool:
+    return str(fmt.get("vcodec") or "none") != "none"
+
+
+def _has_audio(fmt: dict) -> bool:
+    return str(fmt.get("acodec") or "none") != "none"
+
+
+def _pick_audio(formats: list[dict], duration: float, budget: int) -> dict | None:
+    """Лучшая звуковая дорожка, которая не съедает весь лимит."""
+    audio = [fmt for fmt in formats if _has_audio(fmt) and not _has_video(fmt)]
+    if not audio:
+        return None
+    # m4a кладётся в mp4 без перекодирования, поэтому предпочитаем его
+    preferred = [fmt for fmt in audio if fmt.get("ext") == "m4a"] or audio
+    preferred.sort(key=lambda fmt: -(fmt.get("abr") or 0))
+    for fmt in preferred:
+        if _stream_size(fmt, duration) <= budget * AUDIO_BUDGET_SHARE:
+            return fmt
+    return min(preferred, key=lambda fmt: _stream_size(fmt, duration) or SIZE_UNKNOWN)
+
+
+def _select_format(info: dict, max_quality: int, limit: int) -> FormatPick:
+    """Выбирает лучшее качество, которое влезет в лимит отправки Telegram.
+
+    Возвращает явные id дорожек: расплывчатые селекторы вроде "bv*+ba" молча
+    скатываются к неожиданному варианту, а нам нужно точно знать, что качаем.
+    """
+    duration = float(info.get("duration") or 0)
+    formats = [fmt for fmt in (info.get("formats") or []) if fmt.get("format_id")]
+    budget = int(limit * CONTAINER_OVERHEAD)
+
+    audio = _pick_audio(formats, duration, budget)
+    audio_size = _stream_size(audio, duration) if audio else 0
+
+    candidates: list[FormatPick] = []
+    for fmt in formats:
+        if not _has_video(fmt):
+            continue
+        quality = _quality_of(fmt)
+        if max_quality and quality and quality > max_quality:
+            continue
+        if _has_audio(fmt):  # готовый файл со звуком (TikTok, Instagram, YouTube 360p)
+            spec, size = fmt["format_id"], _stream_size(fmt, duration)
+        elif audio:  # отдельные дорожки, склеим через ffmpeg
+            spec = f"{fmt['format_id']}+{audio['format_id']}"
+            size = _stream_size(fmt, duration) + audio_size
+        else:
+            continue
+        candidates.append(
+            FormatPick(
+                spec=spec,
+                quality=quality,
+                width=int(fmt.get("width") or 0),
+                height=int(fmt.get("height") or 0),
+                size=size,
+                rank=_codec_rank(fmt),
+            )
+        )
+
+    if not candidates:
+        raise AudioError("Не нашёл ни одной дорожки с видео — возможно, по ссылке только звук или фото.")
+
+    # Лучшее качество; при равном качестве — удобный кодек, затем меньший размер
+    candidates.sort(key=lambda pick: (-pick.quality, pick.rank, pick.size or SIZE_UNKNOWN))
+    best_quality = candidates[0].quality
+
+    fitting = [pick for pick in candidates if 0 < pick.size <= budget]
+    if fitting:
+        chosen = fitting[0]
+    else:
+        # Размер известен не всегда; тогда пробуем и проверяем уже скачанный файл
+        unknown = [pick for pick in candidates if not pick.size]
+        if not unknown:
+            smallest = min(candidates, key=lambda pick: pick.size)
+            raise AudioError(
+                f"Даже в самом низком качестве ({smallest.quality}p) ролик весит около "
+                f"{smallest.size / 1024 / 1024:.0f} МБ, а Telegram принимает от бота не больше "
+                f"{limit / 1024 / 1024:.0f} МБ. Поднимите локальный Bot API сервер "
+                "(TELEGRAM_API_URL) — с ним лимит вырастет до 2000 МБ."
+            )
+        chosen = unknown[0]
+
+    chosen.downgraded = bool(best_quality and chosen.quality < best_quality)
+    chosen.best_quality = best_quality
+    return chosen
+
+
 def _download_video_sync(url: str, workdir: Path, settings: Settings, progress: Progress) -> DownloadedVideo:
-    height = settings.max_download_height
+    with YoutubeDL(_base_ydl_opts(settings, url)) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    if info.get("_type") == "playlist":
+        entries = [entry for entry in info.get("entries") or [] if entry]
+        if not entries:
+            raise AudioError("По ссылке нет доступных видео.")
+        info = entries[0]
+
+    pick = _select_format(info, settings.max_download_height, settings.max_upload_bytes)
+    logger.info("Качаю %s в %sp (ожидаемо %.1f МБ)", url, pick.quality, pick.size / 1024 / 1024)
+
     opts = _base_ydl_opts(settings, url) | {
-        # mp4+m4a — то, что Telegram играет прямо в чате; остальные варианты запасные.
-        # TikTok и Instagram отдают готовый прогрессивный файл, его подхватит "b[height<=N]"
-        "format": (
-            f"bv*[height<={height}][ext=mp4]+ba[ext=m4a]/"
-            f"bv*[height<={height}]+ba/b[height<={height}]/b"
-        ),
+        "format": pick.spec,
         "merge_output_format": "mp4",
         "outtmpl": str(workdir / "video.%(ext)s"),
         "progress_hooks": [_progress_hook(progress)],
-        # Обрывает закачку, не дожидаясь конца, если поток заведомо больше лимита Telegram
-        "max_filesize": settings.max_upload_bytes,
+        # max_filesize здесь недопустим: он обрывает дорожку на полуслове, склейка
+        # не происходит, и в рабочей папке остаётся битый огрызок. Размер мы уже
+        # учли при выборе формата, а итоговый файл проверим после скачивания.
     }
 
     with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+        result = ydl.extract_info(url, download=True)
 
-    downloads = info.get("requested_downloads") or []
+    downloads = result.get("requested_downloads") or []
     path = Path(downloads[0]["filepath"]) if downloads and downloads[0].get("filepath") else None
-    if path is None or not path.exists():
-        candidates = sorted(workdir.glob("video.*"))
-        path = candidates[0] if candidates else None
-    if path is None or not path.exists():
-        raise AudioError(
-            f"Видео не скачалось целиком — скорее всего, оно больше {settings.max_upload_mb} МБ. "
-            f"Уменьшите MAX_DOWNLOAD_HEIGHT (сейчас {height}p) или скачайте видео вручную."
-        )
+    # Никакого перебора workdir по маске: под неё попадают промежуточные дорожки
+    # и .part-файлы, которые выглядят как готовое видео, но не являются им
+    if path is None or not path.exists() or path.stat().st_size == 0:
+        raise AudioError("Видео скачалось не полностью — попробуйте ещё раз.")
 
-    formats = info.get("requested_formats") or [info]
     return DownloadedVideo(
         path=path,
-        title=str(info.get("title") or "video"),
-        duration=int(info.get("duration") or 0),
-        width=int(next((fmt.get("width") for fmt in formats if fmt.get("width")), 0) or 0),
-        height=int(next((fmt.get("height") for fmt in formats if fmt.get("height")), 0) or 0),
+        title=str(result.get("title") or "video"),
+        duration=int(result.get("duration") or 0),
+        width=pick.width,
+        height=pick.height,
+        quality=pick.quality,
+        downgraded=pick.downgraded,
+        best_quality=pick.best_quality,
     )
+
+
+async def _stream_kinds(path: Path) -> set[str]:
+    process = await asyncio.create_subprocess_exec(
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "csv=p=0",
+        str(path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await process.communicate()
+    return {line.strip() for line in stdout.decode("utf-8", "replace").splitlines() if line.strip()}
 
 
 async def download_video(
     url: str, workdir: Path, settings: Settings, progress: Progress
 ) -> DownloadedVideo:
-    """Скачивает видео со звуком в mp4 не выше MAX_DOWNLOAD_HEIGHT."""
+    """Скачивает видео со звуком в mp4 в лучшем качестве, которое влезает в лимит."""
     platform = detect_platform(url)
     try:
         video = await asyncio.to_thread(_download_video_sync, url, workdir, settings, progress)
@@ -380,6 +553,13 @@ async def download_video(
     except Exception as exc:  # noqa: BLE001
         logger.exception("Не удалось скачать видео")
         raise AudioError(_humanize_download_error(exc, platform)) from exc
+
+    # Страховка от того самого случая, когда пользователю уходил файл без картинки
+    kinds = await _stream_kinds(video.path)
+    if not {"video", "audio"} <= kinds:
+        missing = "звука" if "video" in kinds else "картинки"
+        logger.error("Битый результат скачивания %s: дорожки %s", url, kinds or "не читаются")
+        raise AudioError(f"Скачанный файл получился без {missing}. Попробуйте ещё раз.")
 
     size = video.path.stat().st_size
     if size > settings.max_upload_bytes:

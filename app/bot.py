@@ -512,10 +512,10 @@ class JobQueue:
             header += f"\n⏱ {format_hms(info.duration)}"
 
         progress = Progress()
-        quality = f"до {self._settings.max_download_height}p"
-        await status.set(f"{header}\n\n⬇️ Скачиваю видео ({quality})…")
+        limit = f"до {self._settings.max_download_height}p"
+        await status.set(f"{header}\n\n⬇️ Подбираю качество ({limit}) и скачиваю…")
         async with periodic(
-            lambda: status.set(f"{header}\n\n⬇️ Скачиваю видео ({quality})…{progress.as_suffix()}")
+            lambda: status.set(f"{header}\n\n⬇️ Скачиваю видео ({limit})…{progress.as_suffix()}")
         ):
             video = await download_video(url, workdir, self._settings, progress)
 
@@ -523,7 +523,12 @@ class JobQueue:
         await status.set(f"{header}\n\n📤 Отправляю файл ({size_mb:.0f} МБ)…")
         await self._bot.send_chat_action(job.chat_id, ChatAction.UPLOAD_VIDEO)
 
-        caption = header[:CAPTION_LIMIT]
+        # Показываем реальное качество: если ролик не влез в лимит целиком,
+        # человек должен понимать, почему получил 480p вместо 1080p
+        caption = header
+        if video.quality_note:
+            caption += f"\n🎚 {video.quality_note} · {size_mb:.0f} МБ"
+        caption = caption[:CAPTION_LIMIT]
         key = await asyncio.to_thread(remember_link, self._settings, url)
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[

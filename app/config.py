@@ -144,7 +144,7 @@ def load_settings() -> Settings:
         max_file_mb=_env_int("MAX_FILE_MB", 2000 if _env_str("TELEGRAM_API_URL") else 20),
         # Обратно Telegram принимает от бота до 50 МБ, локальный сервер — до 2000 МБ
         max_upload_mb=_env_int("MAX_UPLOAD_MB", 2000 if _env_str("TELEGRAM_API_URL") else 50),
-        max_download_height=max(144, _env_int("MAX_DOWNLOAD_HEIGHT", 720)),
+        max_download_height=max(144, _env_int("MAX_DOWNLOAD_HEIGHT", 1080)),
         group_debounce_seconds=max(0.5, _env_float("GROUP_DEBOUNCE_SECONDS", 4.0)),
         max_group_items=max(2, _env_int("MAX_GROUP_ITEMS", 50)),
         log_level=_env_str("LOG_LEVEL", "INFO").upper(),
