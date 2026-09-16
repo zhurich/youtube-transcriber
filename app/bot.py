@@ -1273,6 +1273,14 @@ async def run(settings: Settings) -> None:
         # Локальный telegram-bot-api отдаёт файлы до 2 ГБ и кладёт их прямо на диск
         session = AiohttpSession(api=TelegramAPIServer.from_base(settings.telegram_api_url, is_local=True))
         logger.info("Использую локальный Bot API: %s", settings.telegram_api_url)
+    else:
+        logger.info("Использую облачный Bot API (TELEGRAM_API_URL не задан)")
+    logger.info(
+        "Лимиты: приём файла до %s МБ, отправка до %s МБ, качество до %sp",
+        settings.max_file_mb,
+        settings.max_upload_mb,
+        settings.max_download_height,
+    )
 
     bot = Bot(
         token=settings.bot_token,
